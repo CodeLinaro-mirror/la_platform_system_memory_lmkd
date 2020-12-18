@@ -157,6 +157,10 @@
 #define PSI_CONT_EVENT_THRESH (4)
 #define LMKD_REINIT_PROP "lmkd.reinit"
 
+#define PSI_OLD_LOW_THRESH_MS 70
+#define PSI_OLD_MED_THRESH_MS 100
+#define PSI_OLD_CRIT_THRESH_MS 70
+
 static inline int sys_pidfd_open(pid_t pid, unsigned int flags) {
     return syscall(__NR_pidfd_open, pid, flags);
 }
@@ -235,11 +239,12 @@ static int psi_cont_event_thresh = PSI_CONT_EVENT_THRESH;
 static int psi_window_size_ms = PSI_WINDOW_SIZE_MS;
 static int psi_poll_period_scrit_ms = PSI_POLL_PERIOD_SHORT_MS;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
-    { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
-    { PSI_SOME, 100 },   /* 100ms out of 1sec for partial stall */
-    { PSI_FULL, 70 },    /* 70ms out of 1sec for complete stall */
+    { PSI_SOME, PSI_OLD_LOW_THRESH_MS },    /* Default 70ms out of 1sec for partial stall */
+    { PSI_SOME, PSI_OLD_MED_THRESH_MS },   /* Default 100ms out of 1sec for partial stall */
+    { PSI_FULL, PSI_OLD_CRIT_THRESH_MS },    /* Default 70ms out of 1sec for complete stall */
     { PSI_FULL, PSI_SCRIT_COMPLETE_STALL_MS }, /* Default 80ms out of 1sec for complete stall */
 };
+static int wmark_boost_factor = 1;
 
 static android_log_context ctx;
 
@@ -607,8 +612,11 @@ static union vmstat s_crit_base;
 static bool s_crit_event = false;
 static bool s_crit_event_upgraded = false;
 
-/* PAGE_SIZE / 1024 */
-static long page_k;
+/*
+ * Initialize this as we decide the window size based on ram size for
+ * lowram targets on old strategy.
+ */
+static long page_k = PAGE_SIZE / 1024;
 
 static void init_PreferredApps();
 static void update_perf_props();
@@ -2773,10 +2781,10 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi __unused,
     if (nr_free_pages < watermarks->min_wmark) {
         return WMARK_MIN;
     }
-    if (nr_free_pages < watermarks->low_wmark) {
+    if (nr_free_pages < wmark_boost_factor * watermarks->low_wmark) {
         return WMARK_LOW;
     }
-    if (nr_free_pages < watermarks->high_wmark) {
+    if (nr_free_pages < wmark_boost_factor * watermarks->high_wmark) {
         return WMARK_HIGH;
     }
     return WMARK_NONE;
@@ -2901,6 +2909,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         LOW_MEM_AND_THRASHING,
         DIRECT_RECL_AND_THRASHING,
         DIRECT_RECL_AND_THROT,
+        DIRECT_RECL_AND_LOW_MEM,
         COMPACTION,
         KILL_REASON_COUNT
     };
@@ -3096,10 +3105,13 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
          */
         kill_reason = PRESSURE_AFTER_KILL;
         strlcpy(kill_desc, "min watermark is breached even after kill", sizeof(kill_desc));
+        if (wmark > WMARK_MIN) {
+            min_score_adj = VISIBLE_APP_ADJ;
+        }
     } else if (reclaim == DIRECT_RECLAIM_THROTTLE) {
         kill_reason = DIRECT_RECL_AND_THROT;
         strlcpy(kill_desc, "system processes are being throttled", sizeof(kill_desc));
-    } else if (level >= VMPRESS_LEVEL_CRITICAL && (events != 0 || wmark <= WMARK_HIGH)) {
+    } else if (level >= VMPRESS_LEVEL_CRITICAL && wmark <= WMARK_HIGH) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
          * Critical level is triggered when PSI complete stall (all tasks are blocked because
@@ -3117,7 +3129,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             "kB < %" PRId64 "kB) and thrashing (%" PRId64 "%%)",
             mi.field.free_swap * page_k, swap_low_threshold * page_k, thrashing);
         /* Do not kill perceptible apps unless below min watermark */
-        if (wmark > WMARK_MIN && level == VMPRESS_LEVEL_MEDIUM) {
+        if (wmark > WMARK_MIN) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
         }
     } else if (swap_is_low && wmark <= WMARK_HIGH) {
@@ -3145,6 +3157,10 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         cut_thrashing_limit = true;
         /* Do not kill perceptible apps because of thrashing */
         min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+    } else if (reclaim == DIRECT_RECLAIM && wmark <= WMARK_HIGH) {
+        kill_reason = DIRECT_RECL_AND_LOW_MEM;
+        strlcpy(kill_desc, "device is in direct reclaim and low on memory", sizeof(kill_desc));
+        min_score_adj = PERCEPTIBLE_APP_ADJ;
     } else if (in_compaction && wmark <= WMARK_HIGH) {
         kill_reason = COMPACTION;
         strlcpy(kill_desc, "device is in compaction and low on memory", sizeof(kill_desc));
@@ -3201,6 +3217,8 @@ no_kill:
     if (swap_is_low || killing) {
         /* Fast polling during and after a kill or when swap is low */
         poll_params->polling_interval_ms = PSI_POLL_PERIOD_SHORT_MS;
+    } else if (level == VMPRESS_LEVEL_SUPER_CRITICAL) {
+        poll_params->polling_interval_ms = psi_poll_period_scrit_ms;
     } else {
         /* By default use long intervals */
         poll_params->polling_interval_ms = PSI_POLL_PERIOD_LONG_MS;
@@ -3241,8 +3259,13 @@ enum vmpressure_level upgrade_vmpressure_event(enum vmpressure_level level)
 			    if (count_upgraded_event >= 4) {
 				    count_upgraded_event = 0;
 				    s_crit_event = true;
-			    } else
+				    if (debug_process_killing)
+					    ULMK_LOG(D, "Medium/Critical is permanently upgraded to Supercritical event\n");
+			    } else {
 				    s_crit_event = s_crit_event_upgraded = true;
+				    if (debug_process_killing)
+					    ULMK_LOG(D, "Medium/Critical is upgraded to Supercritical event\n");
+			    }
 			    s_crit_base = current;
 		    }
 		    sync = async = 0;
@@ -3600,6 +3623,10 @@ static bool init_psi_monitors() {
         psi_thresholds[VMPRESS_LEVEL_LOW].threshold_ms = 0;
         psi_thresholds[VMPRESS_LEVEL_MEDIUM].threshold_ms = psi_partial_stall_ms;
         psi_thresholds[VMPRESS_LEVEL_CRITICAL].threshold_ms = psi_complete_stall_ms;
+    } else {
+        psi_thresholds[VMPRESS_LEVEL_LOW].threshold_ms = PSI_OLD_LOW_THRESH_MS;
+        psi_thresholds[VMPRESS_LEVEL_MEDIUM].threshold_ms = PSI_OLD_MED_THRESH_MS;
+        psi_thresholds[VMPRESS_LEVEL_CRITICAL].threshold_ms = PSI_OLD_CRIT_THRESH_MS;
     }
 
     if (!init_mp_psi(VMPRESS_LEVEL_LOW, use_new_strategy)) {
@@ -3745,22 +3772,8 @@ static void destroy_monitors() {
     }
 }
 
-static int init(void) {
-    static struct event_handler_info kernel_poll_hinfo = { 0, kernel_event_handler };
-    struct reread_data file_data = {
-        .filename = ZONEINFO_PATH,
-        .fd = -1,
-    };
-    struct epoll_event epev;
-    int pidfd;
+static void update_psi_window_size() {
     union meminfo info;
-    int i;
-    int ret;
-
-    page_k = sysconf(_SC_PAGESIZE);
-    if (page_k == -1)
-        page_k = PAGE_SIZE;
-    page_k /= 1024;
 
     if (force_use_old_strategy) {
 	    if (!meminfo_parse(&info)) {
@@ -3780,13 +3793,31 @@ static int init(void) {
 	    } else
 		    ULMK_LOG(E, "Failed to parse the meminfo\n");
     }
-
     /*
      * Ensure min polling period for supercritical event is no less than
      * PSI_POLL_PERIOD_SHORT_MS.
      */
     if (psi_poll_period_scrit_ms < PSI_POLL_PERIOD_SHORT_MS)
 	    psi_poll_period_scrit_ms = PSI_POLL_PERIOD_SHORT_MS;
+}
+
+static int init(void) {
+    static struct event_handler_info kernel_poll_hinfo = { 0, kernel_event_handler };
+    struct reread_data file_data = {
+        .filename = ZONEINFO_PATH,
+        .fd = -1,
+    };
+    struct epoll_event epev;
+    int pidfd;
+    int i;
+    int ret;
+
+    page_k = sysconf(_SC_PAGESIZE);
+    if (page_k == -1)
+        page_k = PAGE_SIZE;
+    page_k /= 1024;
+
+    update_psi_window_size();
 
     epollfd = epoll_create(MAX_EPOLL_EVENTS);
     if (epollfd == -1) {
@@ -4226,6 +4257,27 @@ static void update_perf_props() {
           snprintf(default_value, PROPERTY_VALUE_MAX, "%d", PSI_CONT_EVENT_THRESH);
           strlcpy(property, perf_get_prop("ro.lmk.psi_cont_event_thresh", default_value).value, PROPERTY_VALUE_MAX);
           psi_cont_event_thresh = strtod(property, NULL);
+
+          snprintf(default_value, PROPERTY_VALUE_MAX, "%d", DEF_THRASHING);
+          strlcpy(property, perf_get_prop("ro.lmk.thrashing_threshold", default_value).value, PROPERTY_VALUE_MAX);
+          thrashing_limit_pct = strtod(property, NULL);
+
+          snprintf(default_value, PROPERTY_VALUE_MAX, "%d", DEF_THRASHING_DECAY);
+          strlcpy(property, perf_get_prop("ro.lmk.thrashing_decay", default_value).value, PROPERTY_VALUE_MAX);
+          thrashing_limit_decay_pct = strtod(property, NULL);
+
+          snprintf(default_value, PROPERTY_VALUE_MAX, "%d", DEF_LOW_SWAP);
+          strlcpy(property, perf_get_prop("ro.lmk.nstrat_low_swap", default_value).value, PROPERTY_VALUE_MAX);
+          swap_free_low_percentage = strtod(property, NULL);
+
+          snprintf(default_value, PROPERTY_VALUE_MAX, "%d", psi_partial_stall_ms);
+          strlcpy(property, perf_get_prop("ro.lmk.nstrat_psi_partial_ms", default_value).value, PROPERTY_VALUE_MAX);
+          psi_partial_stall_ms = strtod(property, NULL);
+
+          snprintf(default_value, PROPERTY_VALUE_MAX, "%d", psi_complete_stall_ms);
+          strlcpy(property, perf_get_prop("ro.lmk.nstrat_psi_complete_ms", default_value).value, PROPERTY_VALUE_MAX);
+          psi_complete_stall_ms = strtod(property, NULL);
+
           /*The following properties are not intoduced by Google
            *hence kept as it is */
           strlcpy(property, perf_get_prop("ro.lmk.enhance_batch_kill", "true").value, PROPERTY_VALUE_MAX);
@@ -4238,9 +4290,13 @@ static void update_perf_props() {
           enable_watermark_check = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
           strlcpy(property, perf_get_prop("ro.lmk.enable_preferred_apps", "false").value, PROPERTY_VALUE_MAX);
           enable_preferred_apps = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
+          snprintf(default_value, PROPERTY_VALUE_MAX, "%d", wmark_boost_factor);
+          strlcpy(property, perf_get_prop("ro.lmk.nstrat_wmark_boost_factor", default_value).value, PROPERTY_VALUE_MAX);
+          wmark_boost_factor = strtod(property, NULL);
 
           //Update kernel interface during re-init.
           use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
+	  update_psi_window_size();
     }
 
     /* Load IOP library for PApps */
