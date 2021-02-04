@@ -3382,7 +3382,8 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
         // kill any process, since enough memory is available.
         if (mem_pressure > downgrade_pressure) {
             if (debug_process_killing) {
-                ALOGI("Ignore %s memory pressure", level_name[level]);
+                ALOGI("Ignore %s memory pressure, swap_free_low_percentage=%d, mem_pressure=%lld, downgrade_pressure=%lld",
+                    level_name[level],swap_free_low_percentage,mem_pressure,downgrade_pressure);
             }
             return;
         } else if (level == VMPRESS_LEVEL_CRITICAL && mem_pressure > upgrade_pressure) {
@@ -3747,6 +3748,10 @@ static int init(void) {
 
     has_inkernel_module = !access(INKERNEL_MINFREE_PATH, W_OK);
     use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
+
+    if (debug_process_killing) {
+        ALOGE("enable_userspace_lmk= %d", enable_userspace_lmk);
+    }
 
     if (use_inkernel_interface) {
         ALOGI("Using in-kernel low memory killer interface");
@@ -4215,6 +4220,13 @@ int main(int argc, char **argv) {
     }
 
     update_props();
+
+    /* Re-update property use android property since qti_get_prop not ready. */
+    enhance_batch_kill = property_get_bool("ro.lmk.enhance_batch_kill", false);
+    enable_adaptive_lmk = property_get_bool("ro.lmk.enable_adaptive_lmk", false);
+    enable_userspace_lmk = property_get_bool("ro.lmk.enable_userspace_lmk", false);
+    enable_watermark_check = property_get_bool("ro.lmk.enable_watermark_check", false);
+    enable_preferred_apps = property_get_bool("ro.lmk.enable_preferred_apps", false);
 
     ctx = create_android_logger(KILLINFO_LOG_TAG);
 
