@@ -3532,7 +3532,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
          * reaching OOM.
          */
         kill_reason = NOT_RESPONDING;
-        strncpy(kill_desc, "device is not responding", sizeof(kill_desc));
+        strlcpy(kill_desc, "device is not responding", sizeof(kill_desc));
     } else if (swap_is_low && thrashing > thrashing_limit_pct) {
         /* Page cache is thrashing while swap is low */
         kill_reason = LOW_SWAP_AND_THRASHING;
@@ -4085,10 +4085,37 @@ static void destroy_mp_psi(enum vmpressure_level level) {
     mpevfd[level] = -1;
 }
 
+enum class MemcgVersion {
+    kNotFound,
+    kV1,
+    kV2,
+};
+
+static MemcgVersion __memcg_version() {
+    std::string cgroupv2_path, memcg_path;
+
+    if (!CgroupGetControllerPath("memory", &memcg_path)) {
+        return MemcgVersion::kNotFound;
+    }
+    return CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &cgroupv2_path) &&
+                           cgroupv2_path == memcg_path
+                   ? MemcgVersion::kV2
+                   : MemcgVersion::kV1;
+}
+
+static MemcgVersion memcg_version() {
+    static MemcgVersion version = __memcg_version();
+
+    return version;
+}
+
 static bool init_psi_monitors() {
     /*
      * When PSI is used on low-ram devices or on high-end devices without memfree levels
-     * use new kill strategy based on zone watermarks, free swap and thrashing stats
+     * use new kill strategy based on zone watermarks, free swap and thrashing stats.
+     * Also use the new strategy if memcg has not been mounted in the v1 cgroups hiearchy since
+     * the old strategy relies on memcg attributes that are available only in the v1 cgroups
+     * hiearchy.
      */
     bool use_new_strategy =
         GET_LMK_PROPERTY(bool, "use_new_strategy", low_ram_device || !use_minfree_levels);
@@ -4096,6 +4123,10 @@ static bool init_psi_monitors() {
         use_new_strategy = false;
     }
 
+    if (!use_new_strategy && memcg_version() != MemcgVersion::kV1) {
+        ALOGE("Old kill strategy can only be used with v1 cgroup hierarchy");
+        return false;
+    }
     /* In default PSI mode override stall amounts using system properties */
     if (use_new_strategy) {
         /* Do not use low pressure level */
@@ -4130,6 +4161,13 @@ static bool init_psi_monitors() {
 }
 
 static bool init_mp_common(enum vmpressure_level level) {
+    // The implementation of this function relies on memcg statistics that are only available in the
+    // v1 cgroup hierarchy.
+    if (memcg_version() != MemcgVersion::kV1) {
+        ALOGE("%s: global monitoring is only available for the v1 cgroup hierarchy", __func__);
+        return false;
+    }
+
     int mpfd;
     int evfd;
     int evctlfd;
@@ -4977,10 +5015,9 @@ int main(int argc, char **argv) {
                 reaper.thread_cnt());
         }
 
-/*        if (!watchdog.init()) {
+        if (!watchdog.init()) {
             ALOGE("Failed to initialize the watchdog");
         }
-*/
 
         mainloop();
     }
