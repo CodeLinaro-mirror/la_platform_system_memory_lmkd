@@ -221,6 +221,7 @@ static struct timespec last_kill_tm;
 /* lmkd configurable parameters */
 static bool is_userdebug_or_eng_build;
 static bool debug_process_killing;
+static float cache_percent;
 static bool enable_pressure_upgrade;
 static int64_t upgrade_pressure;
 static int64_t downgrade_pressure;
@@ -384,6 +385,7 @@ struct zoneinfo_zone {
     union zoneinfo_zone_fields fields;
     int64_t protection[MAX_NR_ZONES];
     int64_t max_protection;
+    char name[LINE_MAX];
 };
 
 /* zoneinfo per-node fields */
@@ -1876,7 +1878,7 @@ static int zoneinfo_parse_zone(char **buf, struct zoneinfo_zone *zone) {
     return false;
 }
 
-static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
+static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node, char *name) {
     int fields_to_match = ZI_NODE_FIELD_COUNT;
 
     for (char *line = strtok_r(NULL, "\n", buf); line;
@@ -1886,7 +1888,19 @@ static int zoneinfo_parse_node(char **buf, struct zoneinfo_node *node) {
         char *save_ptr;
         int64_t val;
         int field_idx;
+        char zone_name[LINE_MAX + 1];
         enum field_match_result match_res;
+
+        /*
+         * Empty zones would not have per-zone stats, so we might come across a
+         * new zone next. Update zone_name and continue parsing.
+         */
+        if (sscanf(line, "Node %d, zone %" STRINGIFY(LINE_MAX) "s", &node->id, zone_name) == 2) {
+            ALOGE("%s per-node stats not found in zone %s; moving to next zone", __func__, name);
+
+            /* update zone name to be used in struct zoneinfo_zone.name */
+            strlcpy(name, zone_name, LINE_MAX);
+        }
 
         cp = strtok_r(line, " ", &save_ptr);
         if (!cp) {
@@ -1951,7 +1965,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 node = &zi->nodes[node_idx];
                 node->id = node_id;
                 zone_idx = 0;
-                if (!zoneinfo_parse_node(&save_ptr, node)) {
+                if (!zoneinfo_parse_node(&save_ptr, node, zone_name)) {
                     ALOGE("%s parse error", file_data.filename);
                     return -1;
                 }
@@ -1963,6 +1977,7 @@ static int zoneinfo_parse(struct zoneinfo *zi) {
                 ALOGE("%s parse error", file_data.filename);
                 return -1;
             }
+            strlcpy(node->zones[zone_idx].name, zone_name, LINE_MAX);
         }
     }
     if (!node) {
@@ -3109,6 +3124,13 @@ enum zone_watermark {
     WMARK_NONE
 };
 
+static const char *wmark_str[WMARK_NONE + 1] {
+    "min",
+    "low",
+    "high",
+    "none"
+};
+
 struct zone_watermarks {
     long high_wmark;
     long low_wmark;
@@ -3122,32 +3144,69 @@ struct zone_meminfo {
 
 };
 
+static bool should_consider_cache_free(uint32_t events, enum vmpressure_level level)
+{
+    if (cache_percent) {
+        return events? level < VMPRESS_LEVEL_CRITICAL : true;
+    }
+    return false;
+}
+
 /*
  * Returns lowest breached watermark or WMARK_NONE.
  */
-static enum zone_watermark get_lowest_watermark(union meminfo *mi __unused,
-                                                struct zone_meminfo *zmi)
+static enum zone_watermark get_lowest_watermark(union meminfo *mi,
+                                                struct zone_meminfo *zmi, enum vmpressure_level level, uint32_t events)
 {
     struct zone_watermarks *watermarks = &zmi->watermarks;
     int64_t nr_free_pages = zmi->nr_free_pages - zmi->cma_free;
+    int64_t nr_cached_pages = 0;
+    int64_t file_cache;
+    int64_t breached_wm_level = 0;
+    zone_watermark zm_breached = WMARK_NONE;
 
-    if (nr_free_pages < watermarks->min_wmark) {
-        return WMARK_MIN;
+    if (should_consider_cache_free(events, level)) {
+        file_cache = mi->field.cached - mi->field.unevictable - mi->field.shmem;
+        nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
-    if (nr_free_pages < wbf_effective * watermarks->low_wmark) {
-        return WMARK_LOW;
+
+    if (nr_free_pages + nr_cached_pages < watermarks->min_wmark) {
+        zm_breached = WMARK_MIN;
+        breached_wm_level = watermarks->min_wmark;
     }
-    if (nr_free_pages < wbf_effective * watermarks->high_wmark) {
-        return WMARK_HIGH;
+    if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->low_wmark) {
+        zm_breached = WMARK_LOW;
+        breached_wm_level = wbf_effective * watermarks->low_wmark;
     }
-    return WMARK_NONE;
+    if (nr_free_pages + nr_cached_pages * wbf_effective < wbf_effective * watermarks->high_wmark) {
+        zm_breached = WMARK_HIGH;
+        breached_wm_level = wbf_effective * watermarks->high_wmark;
+    }
+
+    if (debug_process_killing) {
+        if (zm_breached > WMARK_MIN) {
+            nr_cached_pages *= wbf_effective;
+        }
+
+        ULMK_LOG(D, "Aggregate wmarks: min: %ld low: %ld high: %ld (nr_free - nr_cma_free): %ld wbf_effective: %d",
+             watermarks->min_wmark, watermarks->low_wmark*wbf_effective, watermarks->high_wmark*wbf_effective, nr_free_pages, wbf_effective);
+
+        ULMK_LOG(D, "smallest wmark breached: %s free_pages: %" PRId64
+             " cached_pages_considered_free: %" PRId64 " breached_wm_level: %" PRId64,
+             wmark_str[zm_breached], nr_free_pages, nr_cached_pages, breached_wm_level);
+    }
+
+    return zm_breached;
 }
 
-static void log_zone_watermarks(struct zoneinfo *zi,
-                                struct zone_watermarks *wmarks) {
+static void log_zone_watermarks(struct zoneinfo *zi) {
     int i, j;
     struct zoneinfo_node *node;
     union zoneinfo_zone_fields *zone_fields;
+
+    if (!debug_process_killing) {
+        return;
+    }
 
     for (i = 0; i < zi->node_count; i++) {
         node = &zi->nodes[i];
@@ -3155,27 +3214,37 @@ static void log_zone_watermarks(struct zoneinfo *zi,
         for (j = 0; j < node->zone_count; j++) {
             zone_fields = &node->zones[j].fields;
 
-            if (debug_process_killing) {
-                ULMK_LOG(D, "Zone: %d nr_free_pages: %" PRId64 " min: %" PRId64
-                     " low: %" PRId64 " high: %" PRId64 " present: %" PRId64
-                     " nr_cma_free: %" PRId64 " max_protection: %" PRId64,
-                     j, zone_fields->field.nr_free_pages,
-                     zone_fields->field.min, zone_fields->field.low,
-                     zone_fields->field.high, zone_fields->field.present,
-                     zone_fields->field.nr_free_cma,
-                     node->zones[j].max_protection);
-            }
+            ULMK_LOG(D, "Zone: %d nr_free_pages: %" PRId64 " min: %" PRId64
+                 " low: %" PRId64 " high: %" PRId64 " present: %" PRId64
+                 " nr_cma_free: %" PRId64 " max_protection: %" PRId64,
+                 j, zone_fields->field.nr_free_pages,
+                 zone_fields->field.min, zone_fields->field.low,
+                 zone_fields->field.high, zone_fields->field.present,
+                 zone_fields->field.nr_free_cma,
+                 node->zones[j].max_protection);
         }
     }
+}
 
-    if (debug_process_killing) {
-        ULMK_LOG(D, "Aggregate wmarks: min: %ld low: %ld high: %ld",
-             wmarks->min_wmark, wmarks->low_wmark, wmarks->high_wmark);
+int64_t get_zone_pgskip_deltas_val(const char* name, int64_t *pgskip_deltas) {
+    int idx;
+
+    for (idx = 0; idx < VS_FIELD_COUNT; idx++) {
+        if (strcasestr(vmstat_field_names[idx], name) != NULL)
+            break;
     }
+
+    if (idx == VS_FIELD_COUNT)
+        return -2;
+
+    return pgskip_deltas[PGSKIP_IDX(idx)];
+
 }
 
 void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t *pgskip_deltas) {
     struct zone_watermarks *watermarks;
+    char zone_name[LINE_MAX];
+    int64_t pgskip_deltas_val = -1;
 
     memset(zmi, 0, sizeof(struct zone_meminfo));
     watermarks = &zmi->watermarks;
@@ -3193,7 +3262,15 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
                 continue;
             }
 
-            if (!pgskip_deltas[PGSKIP_IDX(i++)]) {
+            strlcpy(zone_name, zone->name, LINE_MAX);
+            pgskip_deltas_val = get_zone_pgskip_deltas_val(zone_name, pgskip_deltas);
+
+            if (pgskip_deltas_val == -2)
+                pgskip_deltas_val = pgskip_deltas[PGSKIP_IDX(i++)];
+
+            ALOGE("%s pgskip_deltas_val: %" PRId64 " pgskip_deltas[PGSKIP_IDX(i++)]: %" PRId64, __func__, pgskip_deltas_val, pgskip_deltas[PGSKIP_IDX(i++)]);
+
+            if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
                 watermarks->high_wmark += zone->max_protection + zone->fields.field.high;
@@ -3203,27 +3280,14 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
         }
     }
 
-    log_zone_watermarks(zi, watermarks);
+    log_zone_watermarks(zi);
 }
 
-static void log_meminfo(union meminfo *mi, enum zone_watermark wmark)
+static void log_meminfo(union meminfo *mi)
 {
-    char wmark_str[LINE_MAX];
-
-    if (wmark == WMARK_MIN) {
-        strlcpy(wmark_str, "min", LINE_MAX);
-    } else if (wmark == WMARK_LOW) {
-        strlcpy(wmark_str, "low", LINE_MAX);
-    } else if (wmark == WMARK_HIGH) {
-        strlcpy(wmark_str, "high", LINE_MAX);
-    } else {
-        strlcpy(wmark_str, "none", LINE_MAX);
-    }
-
     if (debug_process_killing) {
-        ULMK_LOG(D, "smallest wmark breached: %s nr_free_pages: %" PRId64
-             " active_anon: %" PRId64 " inactive_anon: %" PRId64
-             " cma_free: %" PRId64, wmark_str, mi->field.nr_free_pages,
+        ULMK_LOG(D, "nr_free_pages: %" PRId64 " active_anon: %" PRId64 " inactive_anon: %" PRId64
+             " cma_free: %" PRId64, mi->field.nr_free_pages,
              mi->field.active_anon, mi->field.inactive_anon,
              mi->field.cma_free);
     }
@@ -3511,8 +3575,8 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     calc_zone_watermarks(&zi, &zone_mem_info, pgskip_deltas);
 
     /* Find out which watermark is breached if any */
-    wmark = get_lowest_watermark(&mi, &zone_mem_info);
-    log_meminfo(&mi, wmark);
+    wmark = get_lowest_watermark(&mi, &zone_mem_info, level, events);
+    log_meminfo(&mi);
     if (level < VMPRESS_LEVEL_CRITICAL && (reclaim == DIRECT_RECLAIM ||
             reclaim == DIRECT_RECLAIM_THROTTLE)) {
         last_event_upgraded = true;
@@ -4970,6 +5034,10 @@ static void update_perf_props() {
             PROPERTY_VALUE_MAX);
         wmark_boost_factor = strtod(property, NULL);
         wbf_effective = wmark_boost_factor;
+
+        snprintf(default_value, PROPERTY_VALUE_MAX, "%f", cache_percent);
+        strlcpy(property, perf_get_prop("ro.lmk.cache_percent", default_value).value, PROPERTY_VALUE_MAX);
+        cache_percent = (float)(strtod(property, NULL) * 0.01);
 
         //Update kernel interface during re-init.
         use_inkernel_interface = has_inkernel_module && !enable_userspace_lmk;
