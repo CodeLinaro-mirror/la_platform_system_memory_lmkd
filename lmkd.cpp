@@ -87,7 +87,7 @@
 #define MEMINFO_PATH "/proc/meminfo"
 #define VMSTAT_PATH "/proc/vmstat"
 #define PROC_STATUS_TGID_FIELD "Tgid:"
-#define TRACE_MARKER_PATH "/sys/kernel/debug/tracing/trace_marker"
+#define TRACE_MARKER_PATH "/sys/kernel/tracing/trace_marker"
 #define LINE_MAX 128
 #define MAX_NR_ZONES 6
 
@@ -3561,7 +3561,8 @@ do_kill:
                 min_score_adj = zone_watermarks_ok(level);
                 if (min_score_adj == OOM_SCORE_ADJ_MAX + 1)
                 {
-                    ULMK_LOG(I, "Ignoring pressure since per-zone watermarks ok");
+	            if (debug_process_killing)
+                       ULMK_LOG(I, "Ignoring pressure since per-zone watermarks ok");
                     return;
                 }
             }
