@@ -3922,7 +3922,9 @@ do_kill:
             } else {
                 min_score_adj = zone_watermarks_ok(level);
                 if (min_score_adj == OOM_SCORE_ADJ_MAX + 1) {
-                    ULMK_LOG(I, "Ignoring pressure since per-zone watermarks ok");
+                    if (debug_process_killing) {
+                        ULMK_LOG(I, "Ignoring pressure since per-zone watermarks ok");
+                    }
                     return;
                 }
             }
