@@ -93,6 +93,7 @@ static inline void trace_kill_end() {}
 #define ZONEINFO_PATH "/proc/zoneinfo"
 #define MEMINFO_PATH "/proc/meminfo"
 #define VMSTAT_PATH "/proc/vmstat"
+#define LRUGEN_STATUS_PATH "/sys/kernel/mm/lru_gen/enabled"
 #define PROC_STATUS_TGID_FIELD "Tgid:"
 #define TRACE_MARKER_PATH "/sys/kernel/tracing/trace_marker"
 #define PROC_STATUS_RSS_FIELD "VmRSS:"
@@ -268,6 +269,7 @@ static int wbf_step = 1, wbf_effective = 1;
 static android_log_context ctx;
 static Reaper reaper;
 static int reaper_comm_fd[2];
+static int32_t MGLRU_status = 0;
 
 enum polling_update {
     POLLING_DO_NOT_CHANGE,
@@ -341,6 +343,8 @@ enum zoneinfo_zone_field {
     ZI_ZONE_HIGH,
     ZI_ZONE_PRESENT,
     ZI_ZONE_NR_FREE_CMA,
+    ZI_ZONE_NR_INACTIVE_FILE,
+    ZI_ZONE_NR_ACTIVE_FILE,
     ZI_ZONE_FIELD_COUNT
 };
 
@@ -351,6 +355,8 @@ static const char* const zoneinfo_zone_field_names[ZI_ZONE_FIELD_COUNT] = {
     "high",
     "present",
     "nr_free_cma",
+    "nr_zone_inactive_file",
+    "nr_zone_active_file",
 };
 
 /* zoneinfo per-zone special fields */
@@ -376,6 +382,8 @@ union zoneinfo_zone_fields {
         int64_t high;
         int64_t present;
         int64_t nr_free_cma;
+        int64_t nr_zone_inactive_file;
+        int64_t nr_zone_active_file;
     } field;
     int64_t arr[ZI_ZONE_FIELD_COUNT];
 };
@@ -513,6 +521,7 @@ enum vmstat_field {
     VS_ACTIVE_FILE,
     VS_WORKINGSET_REFAULT,
     VS_WORKINGSET_REFAULT_FILE,
+    VS_PGREFILL,
     VS_PGSCAN_KSWAPD,
     VS_PGSCAN_DIRECT,
     VS_PGSCAN_DIRECT_THROTTLE,
@@ -535,6 +544,7 @@ static const char* const vmstat_field_names[VS_FIELD_COUNT] = {
     "nr_active_file",
     "workingset_refault",
     "workingset_refault_file",
+    "pgrefill",
     "pgscan_kswapd",
     "pgscan_direct",
     "pgscan_direct_throttle",
@@ -553,6 +563,7 @@ union vmstat {
         int64_t nr_active_file;
         int64_t workingset_refault;
         int64_t workingset_refault_file;
+        int64_t pgrefill;
         int64_t pgscan_kswapd;
         int64_t pgscan_direct;
         int64_t pgscan_direct_throttle;
@@ -3189,6 +3200,8 @@ struct zone_watermarks {
 struct zone_meminfo {
     int64_t nr_free_pages;
     int64_t cma_free;
+    int64_t nr_zone_inactive_file;
+    int64_t nr_zone_active_file;
     struct zone_watermarks watermarks;
 
 };
@@ -3228,7 +3241,7 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     zone_watermark zm_breached = WMARK_NONE;
 
     if (should_consider_cache_free(events, level, in_compaction)) {
-        file_cache = mi->field.active_file + mi->field.inactive_file;;
+        file_cache = zmi->nr_zone_inactive_file + zmi->nr_zone_active_file;
         nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
 
@@ -3278,12 +3291,15 @@ static void log_zone_watermarks(struct zoneinfo *zi) {
 
             ULMK_LOG(D, "Zone: %d nr_free_pages: %" PRId64 " min: %" PRId64
                  " low: %" PRId64 " high: %" PRId64 " present: %" PRId64
-                 " nr_cma_free: %" PRId64 " max_protection: %" PRId64,
+                 " nr_cma_free: %" PRId64 " max_protection: %" PRId64
+                 " nr_zone_inactive_file: %" PRId64 " nr_zone_active_file: %" PRId64,
                  j, zone_fields->field.nr_free_pages,
                  zone_fields->field.min, zone_fields->field.low,
                  zone_fields->field.high, zone_fields->field.present,
                  zone_fields->field.nr_free_cma,
-                 node->zones[j].max_protection);
+                 node->zones[j].max_protection,
+                 zone_fields->field.nr_zone_inactive_file,
+                 zone_fields->field.nr_zone_active_file);
         }
     }
 }
@@ -3339,6 +3355,8 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
             if (!pgskip_deltas_val) {
                 zmi->nr_free_pages += zone->fields.field.nr_free_pages;
                 zmi->cma_free += zone->fields.field.nr_free_cma;
+                zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
+                zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
 
                 max_high = std::max(max_high, zone->fields.field.high);
                 max_low = std::max(max_low, zone->fields.field.low);
@@ -3368,6 +3386,27 @@ static void log_meminfo(union meminfo *mi)
     }
 }
 
+int32_t get_MGLRU_status() {
+    static struct reread_data file_data = {
+        .filename = LRUGEN_STATUS_PATH,
+        .fd = -1,
+    };
+    char *buf;
+
+    if ((buf = reread_file(&file_data)) == NULL) {
+        return MGLRU_status;
+    }
+
+    buf[16] = '\0'; //this cannot be more than 15 characters.
+    MGLRU_status = (int32_t)strtol(buf, NULL, 16);
+
+    if (debug_process_killing) {
+        ALOGD("MGLRU status : %d", MGLRU_status);
+    }
+
+    return MGLRU_status;
+}
+
 static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_t *pgskip_deltas)
 {
     unsigned int i;
@@ -3381,8 +3420,16 @@ static void fill_log_pgskip_stats(union vmstat *vs, int64_t *init_pgskip, int64_
         }
     }
 
+    if (MGLRU_status > 0) {
+        /* When MGLRU is enabled, don't set the pgskip delta for Normal zone.
+           Because it could be because of page-isolation failure as well.
+           In which case, we need to consider Normal Zone watermarks and
+           free memory values for making kill decisions. */
+        pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_NORMAL)] = 0;
+    }
+
     if (debug_process_killing) {
-        ULMK_LOG(D, "pgskip deltas: DMA: %" PRId64 "DMA32: %" PRId64 " Normal: %" PRId64 " High: %"
+        ULMK_LOG(D, "pgskip deltas: DMA: %" PRId64 " DMA32: %" PRId64 " Normal: %" PRId64 " High: %"
              PRId64 " Movable: %" PRId64,
              pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_DMA)],
              pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_DMA32)],
@@ -3403,12 +3450,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     enum reclaim_state {
         NO_RECLAIM = 0,
         KSWAPD_RECLAIM,
+        PGREFILL,
         DIRECT_RECLAIM,
         DIRECT_RECLAIM_THROTTLE,
     };
     static int64_t init_ws_refault;
     static int64_t prev_workingset_refault;
     static int64_t base_file_lru;
+    static int64_t init_pgrefill;
     static int64_t init_pgscan_kswapd;
     static int64_t init_pgscan_direct;
     static int64_t init_direct_throttle;
@@ -3524,13 +3573,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (debug_process_killing) {
         ULMK_LOG(D, "nr_free_pages: %" PRId64 " nr_inactive_file: %" PRId64
              " nr_active_file: %" PRId64  " workingset_refault: %" PRId64
+             " pgrefill: %" PRId64
              " pgscan_kswapd: %" PRId64 " pgscan_direct: %" PRId64
              " pgscan_direct_throttle: %" PRId64 " init_pgscan_direct: %" PRId64
              " init_pgscan_kswapd: %" PRId64 " base_file_lru: %" PRId64
              " init_ws_refault: %" PRId64 " free_swap: %" PRId64
              " total_swap: %" PRId64 " swap_free_percentage: %" PRId64 "%%",
              vs.field.nr_free_pages, vs.field.nr_inactive_file,
-             vs.field.nr_active_file, vs.field.workingset_refault,
+             vs.field.nr_active_file, workingset_refault_file,
+             vs.field.pgrefill,
              vs.field.pgscan_kswapd, vs.field.pgscan_direct,
              vs.field.pgscan_direct_throttle, init_pgscan_direct,
              init_pgscan_kswapd, base_file_lru, init_ws_refault,
@@ -3556,6 +3607,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (vs.field.pgscan_direct != init_pgscan_direct) {
         init_pgscan_direct = vs.field.pgscan_direct;
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
+        init_pgrefill = vs.field.pgrefill;
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
@@ -3565,10 +3617,27 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         reclaim = DIRECT_RECLAIM_THROTTLE;
     } else if (vs.field.pgscan_kswapd != init_pgscan_kswapd) {
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
+        init_pgrefill = vs.field.pgrefill;
         for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
             init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
         }
         reclaim = KSWAPD_RECLAIM;
+    } else if (vs.field.pgrefill != init_pgrefill) {
+        init_pgrefill = vs.field.pgrefill;
+        for (i = VS_PGSKIP_FIRST_ZONE; i <= VS_PGSKIP_LAST_ZONE; i++) {
+            init_pgskip[PGSKIP_IDX(i)] = vs.arr[i];
+        }
+        /*
+         * On a system with only 2 zones, pgrefill indicating that pages are not eligible.
+         * Then there may be real refilling happens for normal zone pages too.
+         *
+         * This makes to consider only normal zone stats when system is under reclaim, under
+         * calc_zone_watermarks.
+         */
+        if (MGLRU_status) {
+            pgskip_deltas[PGSKIP_IDX(VS_PGSKIP_MOVABLE)] = 1;
+        }
+        reclaim = PGREFILL;
     } else if (workingset_refault_file == prev_workingset_refault) {
         if (enable_preferred_apps &&
                   (get_time_diff_ms(&last_pa_update_tm, &curr_tm) >= pa_update_timeout_ms)) {
@@ -5192,6 +5261,9 @@ static void update_perf_props() {
     if (enable_preferred_apps) {
         init_PreferredApps();
     }
+
+    MGLRU_status = get_MGLRU_status();
+
     printLMKDConfigs();
 }
 
