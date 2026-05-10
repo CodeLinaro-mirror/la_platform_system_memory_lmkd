@@ -17,6 +17,7 @@
 #define LOG_TAG "lowmemorykiller"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <pwd.h>
 #include <sched.h>
@@ -37,7 +38,10 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <new>
+#include <optional>
 #include <shared_mutex>
+#include <variant>
 #include <vector>
 
 #include <BpfSyscallWrappers.h>
@@ -189,7 +193,6 @@ static struct timespec kswapd_start_tm;
 
 static int level_oomadj[VMPRESS_LEVEL_COUNT];
 static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1 };
-static bool pidfd_supported;
 static int last_kill_pid_or_fd = -1;
 static struct timespec last_kill_tm;
 enum vmpressure_level prev_level = VMPRESS_LEVEL_LOW;
@@ -528,6 +531,7 @@ struct proc {
     struct adjslot_list asl;
     int pid;
     int pidfd;
+    CgroupFD cgroupfd;
     uid_t uid;
     int oomadj;
     pid_t reg_pid; /* PID of the process that registered this record */
@@ -976,7 +980,8 @@ static int pid_remove(int pid) {
     if (procp->pidfd >= 0 && procp->pidfd != last_kill_pid_or_fd) {
         close(procp->pidfd);
     }
-    free(procp);
+    close(procp->cgroupfd);
+    delete procp;
     return 0;
 }
 
@@ -1198,20 +1203,26 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
 
     procp = pid_lookup(proc.pid);
     if (!procp) {
-        int pidfd = -1;
-
-        if (pidfd_supported) {
-            pidfd = TEMP_FAILURE_RETRY(pidfd_open(proc.pid, 0));
-            if (pidfd < 0) {
-                ALOGE("pidfd_open for pid %d failed; errno=%d", proc.pid, errno);
-                return;
-            }
+        int pidfd = TEMP_FAILURE_RETRY(pidfd_open(proc.pid, 0));
+        if (pidfd < 0) {
+            ALOGE("pidfd_open for pid %d failed; errno=%d", proc.pid, errno);
+            return;
         }
 
-        procp = static_cast<struct proc*>(calloc(1, sizeof(struct proc)));
+        procp = new (std::nothrow) struct proc();
         if (!procp) {
             // Oh, the irony.  May need to rebuild our state.
+            close(pidfd);
             return;
+        }
+
+        if (auto [path, cgroupfd] = std::pair<std::string, int>();
+            CgroupGetAttributePathForProcess("CgroupKill", proc.uid, proc.pid, path) &&
+            (cgroupfd = open(path.c_str(), O_WRONLY | O_CLOEXEC)) >= 0) {
+            procp->cgroupfd = CgroupKillFD{cgroupfd};
+        } else if (CgroupGetAttributePathForProcess("CgroupProcs", proc.uid, proc.pid, path) &&
+            (cgroupfd = open(path.c_str(), O_RDONLY | O_CLOEXEC)) >= 0) {
+            procp->cgroupfd = CgroupProcsFD{cgroupfd}; // 5.10 kernels only
         }
 
         procp->pid = proc.pid;
@@ -2353,7 +2364,8 @@ static void watchdog_callback() {
             continue;
         }
 
-        if (target.valid && reaper.kill({ target.pidfd, target.pid, target.uid }, true) == 0) {
+        if (target.valid &&
+            reaper.kill({ target.pidfd, target.cgroupfd, target.pid, target.uid }, true)) {
             ALOGW("lmkd watchdog killed process %d, oom_score_adj %d", target.pid, oom_score);
             killinfo_log(&target, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL);
             // Can't call pid_remove() from non-main thread, therefore just invalidate the record
@@ -2367,27 +2379,7 @@ static void watchdog_callback() {
 static Watchdog watchdog(WATCHDOG_TIMEOUT_SEC, watchdog_callback);
 
 static bool is_kill_pending(void) {
-    char buf[24];
-
-    if (last_kill_pid_or_fd < 0) {
-        return false;
-    }
-
-    if (pidfd_supported) {
-        return true;
-    }
-
-    /* when pidfd is not supported base the decision on /proc/<pid> existence */
-    snprintf(buf, sizeof(buf), "/proc/%d/", last_kill_pid_or_fd);
-    if (access(buf, F_OK) == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-static bool is_waiting_for_kill(void) {
-    return pidfd_supported && last_kill_pid_or_fd >= 0;
+    return last_kill_pid_or_fd >= 0;
 }
 
 static void stop_wait_for_proc_kill(bool finished) {
@@ -2417,15 +2409,13 @@ static void stop_wait_for_proc_kill(bool finished) {
         }
     }
 
-    if (pidfd_supported) {
-        /* unregister fd */
-        if (epoll_ctl(epollfd, EPOLL_CTL_DEL, last_kill_pid_or_fd, &epev)) {
-            // Log an error and keep going
-            ALOGE("epoll_ctl for last killed process failed; errno=%d", errno);
-        }
-        maxevents--;
-        close(last_kill_pid_or_fd);
+    /* unregister fd */
+    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, last_kill_pid_or_fd, &epev)) {
+        // Log an error and keep going
+        ALOGE("epoll_ctl for last killed process failed; errno=%d", errno);
     }
+    maxevents--;
+    close(last_kill_pid_or_fd);
 
     last_kill_pid_or_fd = -1;
 }
@@ -2461,11 +2451,6 @@ static void start_wait_for_proc_kill(int pid_or_fd) {
 
     last_kill_pid_or_fd = pid_or_fd;
 
-    if (!pidfd_supported) {
-        /* If pidfd is not supported just store PID and exit */
-        return;
-    }
-
     epev.events = EPOLLIN;
     epev.data.ptr = (void *)&kill_done_hinfo;
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, last_kill_pid_or_fd, &epev) != 0) {
@@ -2485,7 +2470,6 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int pidfd = procp->pidfd;
     uid_t uid = procp->uid;
     char *taskname;
-    int kill_result;
     int result = -1;
     struct memory_stat *mem_st;
     struct kill_stat kill_st;
@@ -2557,9 +2541,8 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
       return result;
     }
     start_wait_for_proc_kill(pidfd < 0 ? pid : pidfd);
-    kill_result = reaper.kill({ pidfd, pid, uid }, false);
 
-    if (kill_result) {
+    if (!reaper.kill({ pidfd, procp->cgroupfd, pid, uid }, false)) {
         stop_wait_for_proc_kill(false);
         ALOGE("kill(%d): errno=%d", pid, errno);
         /* Delete process record even when we fail to kill so that we don't get stuck on it */
@@ -3049,7 +3032,7 @@ update_watermarks:
         kill_reason = PRESSURE_AFTER_KILL;
         strncpy(kill_desc, "min watermark is breached even after kill", sizeof(kill_desc));
         kill_desc[sizeof(kill_desc) - 1] = '\0';
-    } else if (level == VMPRESS_LEVEL_CRITICAL && events != 0) {
+    } else if (level == VMPRESS_LEVEL_CRITICAL && events != 0 && wmark <= WMARK_HIGH) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
          * Critical level is triggered when PSI complete stall (all tasks are blocked because
@@ -3116,7 +3099,7 @@ update_watermarks:
         kill_reason = DIRECT_RECL_STUCK;
         snprintf(kill_desc, sizeof(kill_desc), "device is stuck in direct reclaim (%ldms > %dms)",
                  direct_reclaim_duration_ms, direct_reclaim_threshold_ms);
-    } else if (check_filecache) {
+    } else if (check_filecache && wmark <= WMARK_HIGH) {
         int64_t file_lru_kb = (vs.field.nr_inactive_file + vs.field.nr_active_file) * page_k;
 
         if (file_lru_kb < filecache_min_kb) {
@@ -3178,8 +3161,8 @@ update_watermarks:
     }
 
 no_kill:
-    /* Do not poll if kernel supports pidfd waiting */
-    if (is_waiting_for_kill()) {
+    /* Do not poll while waiting on pidfd */
+    if (is_kill_pending()) {
         /* Pause polling if we are waiting for process death notification */
         poll_params->update = POLLING_PAUSE;
         return;
@@ -3443,7 +3426,7 @@ do_kill:
 
         last_report_tm = curr_tm;
     }
-    if (is_waiting_for_kill()) {
+    if (is_kill_pending()) {
         /* pause polling if we are waiting for process death notification */
         poll_params->update = POLLING_PAUSE;
     }
@@ -3741,6 +3724,30 @@ static bool init_reaper() {
     return true;
 }
 
+static void expand_fd_table(unsigned short num_fds) {
+    if (num_fds == 0) return;
+
+    int target_fd = num_fds - 1;
+
+    if (fcntl(target_fd, F_GETFD) != -1) {
+        // No need to expand
+        return;
+    }
+
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd != -1) {
+        if (fd >= target_fd) {
+            close(fd);
+        } else {
+            dup2(fd, target_fd);
+            close(target_fd);
+            close(fd);
+        }
+    } else {
+        ALOGW("Could not expand fdtable to %d: %s", num_fds, strerror(errno));
+    }
+}
+
 static int init(void) {
     static struct event_handler_info kernel_poll_hinfo = { 0, kernel_event_handler };
     struct reread_data file_data = {
@@ -3748,13 +3755,16 @@ static int init(void) {
         .fd = -1,
     };
     struct epoll_event epev;
-    int pidfd;
     int i;
     int ret;
 
     // Initialize page size
     pagesize = getpagesize();
     page_k = pagesize / 1024;
+
+    // Pre-expand the fdtable so we don't need to allocate when memory is low,
+    // which could trigger direct reclaim while we're trying to kill.
+    expand_fd_table(2048);
 
     epollfd = epoll_create(MAX_EPOLL_EVENTS);
     if (epollfd == -1) {
@@ -3833,16 +3843,6 @@ static int init(void) {
     if (reread_file(&file_data) == NULL) {
         ALOGE("Failed to read %s: %s", file_data.filename, strerror(errno));
     }
-
-    /* check if kernel supports pidfd_open syscall */
-    pidfd = TEMP_FAILURE_RETRY(pidfd_open(getpid(), 0));
-    if (pidfd < 0) {
-        pidfd_supported = (errno != ENOSYS);
-    } else {
-        pidfd_supported = true;
-        close(pidfd);
-    }
-    ALOGI("Process polling is %s", pidfd_supported ? "supported" : "not supported" );
 
     if (!lmkd_init_hook()) {
         ALOGE("Failed to initialize LMKD hooks.");
@@ -3953,7 +3953,7 @@ static void mainloop(void) {
                 call_handler(poll_params.poll_handler, &poll_params, 0);
             }
         } else {
-            if (kill_timeout_ms && is_waiting_for_kill()) {
+            if (kill_timeout_ms && is_kill_pending()) {
                 clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
                 delay = kill_timeout_ms - get_time_diff_ms(&last_kill_tm, &curr_tm);
                 /* Wait for pidfds notification or kill timeout to expire */
