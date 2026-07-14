@@ -690,7 +690,8 @@ static long page_k = -1;
 
 static void init_PreferredApps();
 static void update_perf_props();
-static void create_handle_for_perf_iop();
+static void create_handle_for_perf();
+static void create_handle_for_iop();
 static void close_handle_for_perf_iop();
 static void * handle_iopd = NULL;
 static void * handle_perfd = NULL;
@@ -1056,11 +1057,24 @@ static struct adjslot_list *adjslot_tail(struct adjslot_list *head) {
 
 static void weightslot_insert(struct weightslot_list *head, struct weightslot_list *new_element)
 {
-    struct weightslot_list *next = head->next;
-    new_element->prev = head;
-    new_element->next = next;
-    next->prev = new_element;
-    head->next = new_element;
+    struct proc *new_proc = container_of(new_element, struct proc, wsl);
+    struct weightslot_list *curr = head->next;
+
+    /* Insert in sorted order by oomadj (ascending: smallest to largest) */
+    while (curr != head) {
+        struct proc *curr_proc = container_of(curr, struct proc, wsl);
+        if (new_proc->oomadj < curr_proc->oomadj) {
+            /* Found the insertion point */
+            break;
+        }
+        curr = curr->next;
+    }
+
+    /* Insert before curr */
+    new_element->next = curr;
+    new_element->prev = curr->prev;
+    curr->prev->next = new_element;
+    curr->prev = new_element;
 }
 
 static void weightslot_remove(struct weightslot_list *old)
@@ -1397,6 +1411,38 @@ static char *proc_get_name(int pid, char *buf, size_t buf_size) {
     }
 
     return buf;
+}
+
+static bool proc_is_top_app(int pid) {
+    static char path[PATH_MAX];
+    static char buf[LINE_MAX];
+    int fd;
+    ssize_t ret;
+
+    /* Check if process is in top-app cpuset (foreground application) */
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+
+    ret = read_all(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (ret <= 0) {
+        return false;
+    }
+    buf[ret] = '\0';
+
+    /* Check if the process is in top-app cpuset
+     * The cgroup file contains lines like:
+     * 1:cpuset:/top-app
+     * We need to check if "top-app" is present in the cpuset controller
+     */
+    if (strstr(buf, "top-app") != NULL) {
+        return true;
+    }
+
+    return false;
 }
 
 static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred* cred) {
@@ -3163,12 +3209,48 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
                 ALOGE("Find target kill app from default list: size=%zu", killed_size);
             }
         } else {
+            if (debug_process_killing) {
+                // Log all processes in weight lists before attempting any kills
+                for (int i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
+                    struct weightslot_list *head = &procweightslot_list[i];
+                    struct weightslot_list *curr = head->prev;
+                    struct proc *procp;
+
+                    ALOGI("Weight list[%d]", i);
+                    int j = 0;
+                    while (curr != head) {
+                        j++;
+                        procp = container_of(curr, struct proc, wsl);
+                        char buf[BUF_MAX];
+                        const char* proc_name = proc_get_name(procp->pid, buf, sizeof(buf));
+                        ALOGI("    %d : oomadj=%d, pid=%d, top-app=%s, process_name=%s",
+                            j, procp->oomadj, procp->pid,
+                            (procp->oomadj == 0 && proc_is_top_app(procp->pid)) ? "TRUE" : "FALSE",
+                            proc_name ? proc_name : "unknown");
+                        curr = curr->prev;
+                    }
+                }
+            }
+
             bool process_killed = false;
 
             for (int i = 0; i < WEIGHT_TO_SLOT_COUNT && !process_killed; i++) {
+                struct weightslot_list *head = &procweightslot_list[i];
+                struct weightslot_list *curr = head->prev;
                 struct proc *procp;
 
-                while ((procp = proc_weight_tail(i))) {
+                while (curr != head) {
+                    procp = container_of(curr, struct proc, wsl);
+                    struct weightslot_list *prev = curr->prev;
+
+                    // Kill weight processes (Weight 0->3), but SKIP foreground (top-app cpuset).
+                    // Skipped processes will be handled in last tier (Retry pass)
+                    if (lazy_kill_visible_proc_enabled && procp->oomadj == 0 &&
+                                proc_is_top_app(procp->pid)) {
+                        curr = prev;
+                        continue;
+                    }
+
                     killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
 
                     if (killed_size >= 0) {
@@ -3183,6 +3265,7 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
                         }
                         break; // Exit inner while loop
                     }
+                    curr = prev;
                 }
             }
         }
@@ -3432,7 +3515,7 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
                  * So, consider the file caches only from the zones with
                  * watermark breached.
                  */
-                if (MGLRU_status == 0 || zone->fields.field.nr_free_pages <= zone->fields.field.high * wbf_effective){
+                if (MGLRU_status == 0 || (zone->fields.field.nr_free_pages - zone->fields.field.nr_free_cma) <= zone->fields.field.high * wbf_effective){
                     zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
                     zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
                 }
@@ -4057,6 +4140,15 @@ update_watermarks:
         psi_parse_io(&psi_data);
         psi_parse_cpu(&psi_data);
         int pages_freed = 0;
+        // Kill Tier:
+        // 1. Tier 4 (First): Ordinary Background Apps (Adj > 100)
+        //    - Handled by standard list in Pass 1.
+        // 2. Tier 3: Weighted Background Apps (Weight 0-3, Non top-app)
+        //    - Handled by weight list in Pass 1.
+        // 3. Tier 2: Ordinary Visible Apps (Adj <= 100)
+        //    - Handled by standard list in Pass 2 (Retry).
+        // 4. Tier 1 (Last): Weighted Foreground Apps (Weight 0-3, top-app)
+        //    - Handled by weight list in Pass 2 (Retry).
         pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
         if (pages_freed <= 0 && lazy_kill_weight_proc_enabled) {
             lazy_kill_visible_proc_enabled = false;
@@ -4923,15 +5015,20 @@ static int on_boot_completed() {
     return res == BOOT_COMPLETED_NOTIF_SUCCESS ? 0 : -1;
 }
 
-static void create_handle_for_perf_iop() {
+static void create_handle_for_perf() {
     handle_perfd = dlopen(PERFD_LIB, RTLD_NOW);
+}
+
+static void create_handle_for_iop() {
     handle_iopd = dlopen(IOPD_LIB, RTLD_NOW);
 }
+
 
 static void close_handle_for_perf_iop() {
     if (handle_perfd != NULL) {
         dlclose(handle_perfd);
     }
+
     if (handle_iopd != NULL) {
         dlclose(handle_iopd);
     }
@@ -4940,6 +5037,7 @@ static void close_handle_for_perf_iop() {
 static void init_PreferredApps() {
     void *handle = NULL;
     if (!use_perf_api_for_pref_apps) {
+        create_handle_for_iop();
         if (handle_iopd != NULL) {
             perf_ux_engine_trigger = (void (*)(int, char *))dlsym(handle_iopd, "perf_ux_engine_trigger");
         }
@@ -5004,7 +5102,7 @@ static void update_perf_props() {
 
     /* Loading the vendor library at runtime to access property value */
     PropVal (*perf_get_prop)(const char *, const char *) = NULL;
-    create_handle_for_perf_iop();
+    create_handle_for_perf();
     if (handle_perfd != NULL) {
         perf_get_prop = (PropVal (*)(const char *, const char *))dlsym(handle_perfd, "perf_get_prop");
     }
